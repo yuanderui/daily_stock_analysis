@@ -13,6 +13,7 @@ A股自选股智能分析系统 - AI分析层
 import json
 import logging
 import math
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -1895,6 +1896,201 @@ class AnalysisResult:
             "low": "⭐",
         }
         return star_map.get(str(self.confidence_level or "").strip().lower(), "⭐⭐")
+
+
+def _deterministic_fallback_enabled() -> bool:
+    return os.getenv("DETERMINISTIC_FALLBACK_ENABLED", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _build_deterministic_analysis_result(
+    context: Dict[str, Any],
+    *,
+    code: str,
+    name: str,
+    report_language: str,
+    safe_error: str,
+) -> AnalysisResult:
+    """Build a rules-only technical/risk summary when every LLM route fails."""
+
+    def _number(value: Any) -> Optional[float]:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        return numeric if math.isfinite(numeric) else None
+
+    trend = context.get("trend_analysis")
+    if not isinstance(trend, dict):
+        trend = context.get("trend_result")
+    if not isinstance(trend, dict):
+        trend = {}
+    realtime = context.get("realtime")
+    if not isinstance(realtime, dict):
+        realtime = {}
+    today = context.get("today")
+    if not isinstance(today, dict):
+        today = {}
+
+    current_price = next(
+        (
+            value
+            for value in (
+                _number(realtime.get("price")),
+                _number(today.get("close")),
+                _number(trend.get("current_price")),
+            )
+            if value is not None and value > 0
+        ),
+        None,
+    )
+    ma5 = _number(today.get("ma5")) or _number(trend.get("ma5"))
+    ma10 = _number(today.get("ma10")) or _number(trend.get("ma10"))
+    ma20 = _number(today.get("ma20")) or _number(trend.get("ma20"))
+    bias_ma5 = _number(trend.get("bias_ma5"))
+    if bias_ma5 is None and current_price is not None and ma5 and ma5 > 0:
+        bias_ma5 = (current_price - ma5) / ma5 * 100
+
+    trend_status = str(trend.get("trend_status") or "unknown").strip().lower()
+    trend_labels = {
+        "strong_bull": "强势偏多",
+        "bull": "偏多",
+        "ranging": "震荡",
+        "sideways": "震荡",
+        "bear": "偏弱",
+        "strong_bear": "强势偏弱",
+        "unknown": "中性/数据有限",
+    }
+    trend_label = trend_labels.get(trend_status, trend_status or "中性/数据有限")
+    ma_alignment = str(trend.get("ma_alignment") or "均线信息不足")
+    volume_status = str(trend.get("volume_status") or "量能信息不足")
+    volume_trend = str(trend.get("volume_trend") or "")
+
+    raw_score = trend.get("signal_score")
+    if raw_score is None:
+        raw_score = trend.get("trend_strength")
+    score = int(round(_number(raw_score) or 50))
+    score = max(0, min(100, score))
+
+    risk_factors = [
+        str(item).strip()
+        for item in (trend.get("risk_factors") or [])
+        if str(item).strip()
+    ]
+    if current_price is not None and ma20 is not None:
+        if current_price < ma20:
+            risk_factors.append("最新价格低于 MA20，趋势支撑仍需确认")
+        else:
+            risk_factors.append("最新价格位于 MA20 上方，但需留意回踩确认")
+    if bias_ma5 is not None and abs(bias_ma5) >= 8:
+        risk_factors.append(f"相对 MA5 乖离率约 {bias_ma5:.2f}%，短线波动风险较高")
+    if not risk_factors:
+        risk_factors.append("技术面风险因子有限，仍需结合后续行情确认")
+
+    if bias_ma5 is None:
+        bias_status = "数据不足"
+    elif abs(bias_ma5) >= 8:
+        bias_status = "危险"
+    elif abs(bias_ma5) >= 4:
+        bias_status = "警戒"
+    else:
+        bias_status = "安全"
+
+    risk_text = "；".join(risk_factors[:3])
+    analysis_summary = (
+        f"{name}({code}) 规则化技术摘要：趋势为{trend_label}，{ma_alignment}；"
+        f"量能状态为{volume_status}"
+        f"{('，' + volume_trend) if volume_trend else ''}；{risk_text}。"
+        "AI 模型当前不可用，本结果仅依据已获取的行情与预设技术规则，"
+        "用于风险观察，不构成买卖建议。"
+    )
+    risk_warning = (
+        "模型生成失败，已切换为规则化技术面兜底。"
+        f"错误类型：{safe_error[:120]}。请将本结果视为风险摘要而非交易指令。"
+    )
+    data_perspective = {
+        "trend_status": {
+            "ma_alignment": ma_alignment,
+            "is_bullish": bool(
+                current_price is not None and ma20 is not None and current_price >= ma20
+            ),
+            "trend_score": score,
+        },
+        "price_position": {
+            "current_price": current_price,
+            "ma5": ma5,
+            "ma10": ma10,
+            "ma20": ma20,
+            "bias_ma5": round(bias_ma5, 2) if bias_ma5 is not None else None,
+            "bias_status": bias_status,
+            "support_level": None,
+            "resistance_level": None,
+        },
+        "volume_analysis": {
+            "volume_status": volume_status,
+            "volume_meaning": volume_trend or "量能信息有限",
+        },
+    }
+    dashboard = {
+        "core_conclusion": {
+            "one_sentence": f"{name}：规则化技术风险摘要，仅供观察",
+            "signal_type": "⚠️风险观察",
+            "time_sensitivity": "非交易日复盘",
+            "position_advice": {
+                "no_position": "不执行交易，仅观察技术面与风险信号",
+                "has_position": "不执行交易，结合自身风险承受能力独立判断",
+            },
+        },
+        "data_perspective": data_perspective,
+        "intelligence": {
+            "latest_news": "AI 模型不可用，本次未生成消息面结论",
+            "risk_alerts": risk_factors,
+            "positive_catalysts": [],
+            "earnings_outlook": "未分析",
+            "sentiment_summary": "消息面未纳入，仅展示技术与风险维度",
+        },
+    }
+    result = AnalysisResult(
+        code=code,
+        name=name,
+        sentiment_score=score,
+        trend_prediction=localize_trend_prediction(
+            "看多"
+            if score >= 60
+            else ("看空" if score < 40 else "震荡"),
+            report_language,
+        ),
+        operation_advice=localize_operation_advice("观望", report_language),
+        decision_type="hold",
+        confidence_level=localize_confidence_level("低", report_language),
+        dashboard=dashboard,
+        analysis_summary=analysis_summary,
+        key_points=(
+            f"趋势：{trend_label}\n"
+            f"均线：{ma_alignment}\n"
+            f"量能：{volume_status}\n"
+            f"风险：{risk_text}"
+        ),
+        risk_warning=risk_warning,
+        technical_analysis=analysis_summary,
+        ma_analysis=ma_alignment,
+        volume_analysis=f"{volume_status} {volume_trend}".strip(),
+        current_price=current_price,
+        change_pct=_number(realtime.get("change_pct")),
+        model_used="rule-based-technical-fallback",
+        data_sources="market_data+technical_rules",
+        success=True,
+        report_language=report_language,
+    )
+    return populate_decision_action_fields(
+        result,
+        explicit_action="watch",
+        align_with_score=False,
+    )
 
 
 def populate_decision_action_fields(
@@ -4285,6 +4481,19 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
         except Exception as e:
             safe_error = self._sanitize_hermes_exception_text(e)
             logger.error("AI 分析 %s(%s) 失败: %s", name, code, safe_error)
+            if _deterministic_fallback_enabled():
+                logger.warning(
+                    "AI 分析 %s(%s) 失败，启用规则化技术面兜底",
+                    name,
+                    code,
+                )
+                return _build_deterministic_analysis_result(
+                    context,
+                    code=code,
+                    name=name,
+                    report_language=report_language,
+                    safe_error=safe_error,
+                )
             return AnalysisResult(
                 code=code,
                 name=name,
